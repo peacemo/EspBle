@@ -66,6 +66,12 @@ static bool new_mac_received = false;
 static bool new_adv_data_received = false;
 static uint16_t new_adv_data_len = 0;
 
+// **新增**: 用于处理长写入的缓冲区
+static uint8_t prepare_write_buf[256];
+static uint16_t prepare_write_len = 0;
+static uint16_t last_prepare_handle = 0;
+
+
 static esp_ble_adv_params_t adv_params = {
     .adv_int_min        = 352, .adv_int_max        = 352, .adv_type           = ADV_TYPE_IND,
     .own_addr_type      = BLE_ADDR_TYPE_PUBLIC, .channel_map        = ADV_CHNL_ALL,
@@ -180,6 +186,38 @@ static void restart_timer_callback(void* arg) {
     esp_restart();
 }
 
+// **新增**: 用于处理写入数据的独立函数
+void handle_write_data(uint16_t handle, uint8_t *value, uint16_t len) {
+    if (handle == gl_profile_tab[PROFILE_APP_ID].char_handle_mac) {
+        if (len == sizeof(new_mac)) {
+            memcpy(new_mac, value, sizeof(new_mac));
+            new_mac_received = true;
+            ESP_LOGI(TAG, "收到新的MAC地址");
+        }
+    } else if (handle == gl_profile_tab[PROFILE_APP_ID].char_handle_adv) {
+        if (len <= sizeof(new_adv_data)) {
+            memcpy(new_adv_data, value, len);
+            new_adv_data_len = len;
+            new_adv_data_received = true;
+            ESP_LOGI(TAG, "收到新的广播数据");
+        }
+    } else if (handle == gl_profile_tab[PROFILE_APP_ID].char_handle_ctl) {
+        if (len == 1 && value[0] == 0x01) {
+            ESP_LOGI(TAG, "收到控制命令: 保存并重启");
+            write_config_to_nvs();
+            
+            const esp_timer_create_args_t restart_timer_args = {
+                .callback = &restart_timer_callback,
+                .name = "restart-timer"
+            };
+            esp_timer_handle_t restart_timer;
+            esp_timer_create(&restart_timer_args, &restart_timer);
+            esp_timer_start_once(restart_timer, 2000 * 1000); // 2 seconds
+        }
+    }
+}
+
+
 static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
     switch (event) {
         case ESP_GATTS_REG_EVT: {
@@ -197,7 +235,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             gl_profile_tab[PROFILE_APP_ID].service_handle = param->create.service_handle;
             esp_ble_gatts_start_service(param->create.service_handle);
             esp_ble_gatts_add_char(param->create.service_handle, &mac_char_uuid, ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
-            esp_ble_gatts_add_char(param->create.service_handle, &adv_char_uuid, ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
+            esp_ble_gatts_add_char(param->create.service_handle, &adv_char_uuid, ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR, NULL, NULL);
             esp_ble_gatts_add_char(param->create.service_handle, &ctl_char_uuid, ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
             break;
         }
@@ -217,40 +255,46 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             esp_ble_gap_start_advertising(&adv_params);
             break;
         case ESP_GATTS_WRITE_EVT: {
-            ESP_LOGI(TAG, "GATT写事件: handle %d, len %d", param->write.handle, param->write.len);
-            
-            // **FIX**: Respond to the write request to prevent disconnection.
-            if (param->write.need_rsp){
-                esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+            // **修正**: 正确处理长写入 (Prepare/Execute Write)
+            if (param->write.is_prep) {
+                ESP_LOGI(TAG, "GATT PREPARE WRITE: handle %d, offset %d, len %d", param->write.handle, param->write.offset, param->write.len);
+                if (param->write.offset == 0) {
+                    last_prepare_handle = param->write.handle;
+                }
+                if (param->write.offset + param->write.len <= sizeof(prepare_write_buf)) {
+                    memcpy(prepare_write_buf + param->write.offset, param->write.value, param->write.len);
+                    prepare_write_len = param->write.offset + param->write.len;
+                } else {
+                    ESP_LOGE(TAG, "Prepare write overflow");
+                }
+                // Echo back the data for prepare write response
+                if (param->write.need_rsp) {
+                    esp_gatt_rsp_t rsp;
+                    rsp.attr_value.handle = param->write.handle;
+                    rsp.attr_value.offset = param->write.offset;
+                    rsp.attr_value.len = param->write.len;
+                    rsp.attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
+                    memcpy(rsp.attr_value.value, param->write.value, param->write.len);
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, &rsp);
+                }
+            } else { // Normal write
+                ESP_LOGI(TAG, "GATT NORMAL WRITE: handle %d, len %d", param->write.handle, param->write.len);
+                if (param->write.need_rsp){
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+                }
+                handle_write_data(param->write.handle, param->write.value, param->write.len);
             }
-            
-            if (param->write.handle == gl_profile_tab[PROFILE_APP_ID].char_handle_mac) {
-                if (param->write.len == sizeof(new_mac)) {
-                    memcpy(new_mac, param->write.value, sizeof(new_mac));
-                    new_mac_received = true;
-                    ESP_LOGI(TAG, "收到新的MAC地址");
-                }
-            } else if (param->write.handle == gl_profile_tab[PROFILE_APP_ID].char_handle_adv) {
-                if (param->write.len <= sizeof(new_adv_data)) {
-                    memcpy(new_adv_data, param->write.value, param->write.len);
-                    new_adv_data_len = param->write.len;
-                    new_adv_data_received = true;
-                    ESP_LOGI(TAG, "收到新的广播数据");
-                }
-            } else if (param->write.handle == gl_profile_tab[PROFILE_APP_ID].char_handle_ctl) {
-                if (param->write.len == 1 && param->write.value[0] == 0x01) {
-                    ESP_LOGI(TAG, "收到控制命令: 保存并重启");
-                    write_config_to_nvs();
-                    
-                    const esp_timer_create_args_t restart_timer_args = {
-                        .callback = &restart_timer_callback,
-                        .name = "restart-timer"
-                    };
-                    esp_timer_handle_t restart_timer;
-                    esp_timer_create(&restart_timer_args, &restart_timer);
-                    esp_timer_start_once(restart_timer, 2000 * 1000); // 2 seconds
-                }
+            break;
+        }
+        case ESP_GATTS_EXEC_WRITE_EVT: {
+            ESP_LOGI(TAG, "GATT EXEC WRITE");
+            esp_ble_gatts_send_response(gatts_if, param->exec_write.conn_id, param->exec_write.trans_id, ESP_GATT_OK, NULL);
+            if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC) {
+                handle_write_data(last_prepare_handle, prepare_write_buf, prepare_write_len);
             }
+            // Reset buffer
+            prepare_write_len = 0;
+            last_prepare_handle = 0;
             break;
         }
         default: break;
