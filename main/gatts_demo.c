@@ -4,101 +4,325 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-
-// --- BLE和MAC地址相关头文件 ---
 #include "esp_bt.h"
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
+#include "esp_gatts_api.h"
+#include "esp_bt_defs.h"
 #include "esp_mac.h"
+#include "sdkconfig.h"
+#include "esp_timer.h"
 
-// 日志打印时使用的标签
-static const char* TAG = "BLE_ADV_FIXED";
+static const char* TAG = "BLE_CONFIGURABLE";
 
-// 广播包数据 (前19字节)
-static uint8_t adv_raw_data[] = {
-    // AD 1: Flags (3 bytes)
-    0x02, 0x01, 0x06,
-    // AD 2: Manufacturer Specific Data (24 bytes)
-    0x17, 0xFF, 0x00, 0x01, 0xB5, 0x00, 0x02, 0x08, 0x21, 0x26, 0x37, 0x00,
-    0x00, 0x04, 0x99, 0x31, 0x39, 0x59, 0x06, 0x01, 0x10, 0x00, 0x00, 0x00,
-    // AD 3: Complete List of 16-bit Service Class UUIDs (4 bytes)
-    0x03, 0x03, 0x3C, 0xFE
+/* ------------------- NVS 定义 ------------------- */
+#define NVS_NAMESPACE "ble_config"
+#define NVS_KEY_MAC "mac_addr"
+#define NVS_KEY_ADV "adv_data"
+#define NVS_KEY_SCAN "scan_data"
+
+/* ------------------- GATT 定义 ------------------- */
+#define GATTS_SERVICE_UUID   0x00FF
+#define GATTS_CHAR_UUID_MAC  0xFF01
+#define GATTS_CHAR_UUID_ADV  0xFF02
+#define GATTS_CHAR_UUID_CTL  0xFF03
+#define GATTS_NUM_HANDLE     8
+
+#define PROFILE_NUM 1
+#define PROFILE_APP_ID 0
+
+struct gatts_profile_inst {
+    esp_gatts_cb_t gatts_cb;
+    uint16_t gatts_if;
+    uint16_t app_id;
+    uint16_t conn_id;
+    uint16_t service_handle;
+    esp_gatt_srvc_id_t service_id;
+    uint16_t char_handle_mac;
+    uint16_t char_handle_adv;
+    uint16_t char_handle_ctl;
 };
 
-// 新的扫描响应包数据 (后13字节)
-static uint8_t scan_rsp_raw_data[] = {
-    // AD 1: Complete Local Name "RTK_BT_4.1" (13 bytes)
-    0x0C, 0x09, 0x52, 0x54, 0x4B, 0x5F, 0x42, 0x54, 0x5F, 0x34, 0x2E, 0x31
+static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param);
+
+static struct gatts_profile_inst gl_profile_tab[PROFILE_NUM] = {
+    [PROFILE_APP_ID] = { .gatts_cb = gatts_profile_event_handler, .gatts_if = ESP_GATT_IF_NONE, },
 };
 
-// 广播参数配置
-// 希望每秒广播一次 (1000ms). 计算公式: 1000ms / 0.625ms = 1600.
+/* ------------------- 全局变量 ------------------- */
+static uint8_t default_mac[6] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};
+static uint8_t default_adv_data[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0xAA, 0xFE, 0x0C, 0x16, 0xAA, 0xFE, 0x00, 0x00, 0x45, 0x53, 0x50, 0x33, 0x32};
+static uint8_t default_scan_rsp_data[] = {0x0F, 0x09, 'E', 'S', 'P', '_', 'C', 'O', 'N', 'F', 'I', 'G', 'U', 'R', 'E'};
+
+static uint8_t current_mac[6];
+static uint8_t current_adv_data[31];
+static uint8_t current_scan_rsp_data[31];
+static uint8_t current_adv_data_len = 0;
+static uint8_t current_scan_rsp_data_len = 0;
+
+static uint8_t new_mac[6];
+static uint8_t new_adv_data[62];
+static bool new_mac_received = false;
+static bool new_adv_data_received = false;
+static uint16_t new_adv_data_len = 0;
+
+static uint8_t prepare_write_buf[256];
+static uint16_t prepare_write_len = 0;
+static uint16_t last_prepare_handle = 0;
+
+
 static esp_ble_adv_params_t adv_params = {
-    .adv_int_min        = 1600,
-    .adv_int_max        = 1600,
-    .adv_type           = ADV_TYPE_IND, // 可被扫描和连接的广播类型
-    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
-    .channel_map        = ADV_CHNL_ALL,
+    .adv_int_min        = 352, .adv_int_max        = 352, .adv_type           = ADV_TYPE_IND,
+    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC, .channel_map        = ADV_CHNL_ALL,
     .adv_filter_policy  = ADV_FILTER_ALLOW_SCAN_ANY_CON_ANY,
 };
 
-// GAP事件回调函数
-static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
-{
-    switch (event) {
-        // 事件：原始广播数据设置完成
-        case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
-            ESP_LOGI(TAG, "原始广播数据设置成功.");
-            ESP_LOGI(TAG, "开始配置扫描响应数据...");
-            // 在广播数据设置完成后，再开始设置扫描响应数据
-            esp_err_t scan_rsp_ret = esp_ble_gap_config_scan_rsp_data_raw(scan_rsp_raw_data, sizeof(scan_rsp_raw_data));
-            if (scan_rsp_ret){
-                ESP_LOGE(TAG, "配置扫描响应数据失败, 错误代码: %x", scan_rsp_ret);
-            }
-            break;
+/* ------------------- NVS 函数 ------------------- */
+void read_config_from_nvs() {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
 
-        // 事件：原始扫描响应数据设置完成
-        case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
-            ESP_LOGI(TAG, "扫描响应数据设置成功.");
-            ESP_LOGI(TAG, "数据全部配置完成，开始广播...");
-            // 在扫描响应数据也设置完成后，才启动广播
-            esp_err_t adv_start_ret = esp_ble_gap_start_advertising(&adv_params);
-            if (adv_start_ret) {
-                ESP_LOGE(TAG, "启动广播失败, 错误代码: %x", adv_start_ret);
-            }
-            break;
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: 打开失败, 为所有配置使用默认值");
+        memcpy(current_mac, default_mac, sizeof(default_mac));
+        memcpy(current_adv_data, default_adv_data, sizeof(default_adv_data));
+        current_adv_data_len = sizeof(default_adv_data);
+        memcpy(current_scan_rsp_data, default_scan_rsp_data, sizeof(default_scan_rsp_data));
+        current_scan_rsp_data_len = sizeof(default_scan_rsp_data);
+        return;
+    }
 
-        // 事件：广播启动完成
-        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-                ESP_LOGE(TAG, "广播启动失败, 错误代码: %d", param->adv_start_cmpl.status);
-            } else {
-                ESP_LOGI(TAG, "广播启动成功! 设备现在可以被扫描到。");
-            }
-            break;
+    size_t mac_size = sizeof(current_mac);
+    err = nvs_get_blob(nvs_handle, NVS_KEY_MAC, current_mac, &mac_size);
+    if (err != ESP_OK || mac_size != sizeof(current_mac)) {
+        ESP_LOGW(TAG, "NVS: 未找到MAC地址, 使用默认值");
+        memcpy(current_mac, default_mac, sizeof(default_mac));
+    }
+
+    size_t adv_size = sizeof(current_adv_data);
+    err = nvs_get_blob(nvs_handle, NVS_KEY_ADV, current_adv_data, &adv_size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: 未找到广播数据, 使用默认值");
+        memcpy(current_adv_data, default_adv_data, sizeof(default_adv_data));
+        current_adv_data_len = sizeof(default_adv_data);
+    } else {
+        current_adv_data_len = adv_size;
+    }
+
+    size_t scan_size = sizeof(current_scan_rsp_data);
+    err = nvs_get_blob(nvs_handle, NVS_KEY_SCAN, current_scan_rsp_data, &scan_size);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: 未找到扫描响应, 使用默认值");
+        memcpy(current_scan_rsp_data, default_scan_rsp_data, sizeof(default_scan_rsp_data));
+        current_scan_rsp_data_len = sizeof(default_scan_rsp_data);
+    } else {
+        current_scan_rsp_data_len = scan_size;
+    }
+    nvs_close(nvs_handle);
+}
+
+esp_err_t write_config_to_nvs() {
+    nvs_handle_t nvs_handle;
+    esp_err_t err;
+    err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "打开NVS失败!"); return err; }
+
+    if (new_mac_received) {
+        err = nvs_set_blob(nvs_handle, NVS_KEY_MAC, new_mac, sizeof(new_mac));
+        if (err == ESP_OK) ESP_LOGI(TAG, "NVS: 新MAC地址已写入");
+        new_mac_received = false;
+    }
+
+    if (new_adv_data_received) {
+        // **修正**: 智能分割收到的原始数据流
+        uint8_t adv_len_to_write = (new_adv_data_len > 31) ? 31 : new_adv_data_len;
         
-        // 事件：广播停止完成 (可选，用于完整性)
-        case ESP_GAP_BLE_ADV_STOP_COMPLETE_EVT:
-            if (param->adv_stop_cmpl.status != ESP_BT_STATUS_SUCCESS) {
-                ESP_LOGE(TAG, "停止广播失败, 错误代码: %d", param->adv_stop_cmpl.status);
-            } else {
-                ESP_LOGI(TAG, "停止广播成功.");
+        err = nvs_set_blob(nvs_handle, NVS_KEY_ADV, new_adv_data, adv_len_to_write);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "NVS: 写入 %d 字节到广播数据", adv_len_to_write);
+        }
+
+        if (new_adv_data_len > 31) {
+            uint8_t scan_len_to_write = new_adv_data_len - 31;
+            if (scan_len_to_write > 31) {
+                scan_len_to_write = 31; // 最多31字节
+            }
+            err = nvs_set_blob(nvs_handle, NVS_KEY_SCAN, &new_adv_data[31], scan_len_to_write);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "NVS: 写入 %d 字节到扫描响应", scan_len_to_write);
+            }
+        } else {
+            // 如果总数据小于31字节，则没有扫描响应数据
+            nvs_erase_key(nvs_handle, NVS_KEY_SCAN);
+            ESP_LOGI(TAG, "NVS: 清除扫描响应数据");
+        }
+        new_adv_data_received = false;
+    }
+
+    err = nvs_commit(nvs_handle);
+    if (err != ESP_OK) ESP_LOGE(TAG, "NVS提交失败!");
+    nvs_close(nvs_handle);
+    return err;
+}
+
+/* ------------------- GAP 回调 ------------------- */
+static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    esp_err_t ret;
+    switch (event) {
+        case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
+            ESP_LOGI(TAG, "广播数据设置完成，开始配置扫描响应...");
+            ret = esp_ble_gap_config_scan_rsp_data_raw(current_scan_rsp_data, current_scan_rsp_data_len);
+            if (ret){
+                ESP_LOGE(TAG, "配置扫描响应失败, 错误代码 = %x", ret);
             }
             break;
-
-        default:
+        case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
+            ESP_LOGI(TAG, "扫描响应设置完成，开始广播...");
+            ret = esp_ble_gap_start_advertising(&adv_params);
+            if (ret) {
+                ESP_LOGE(TAG, "启动广播失败, 错误代码 = %x", ret);
+            }
             break;
+        case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
+            if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) { 
+                ESP_LOGE(TAG, "广播启动失败, 状态码 = %d", param->adv_start_cmpl.status);
+            } 
+            else { 
+                ESP_LOGI(TAG, "广播启动成功"); 
+            }
+            break;
+        default: break;
+    }
+}
+
+/* ------------------- GATT 回调 ------------------- */
+static const esp_bt_uuid_t mac_char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = GATTS_CHAR_UUID_MAC};
+static const esp_bt_uuid_t adv_char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = GATTS_CHAR_UUID_ADV};
+static const esp_bt_uuid_t ctl_char_uuid = {.len = ESP_UUID_LEN_16, .uuid.uuid16 = GATTS_CHAR_UUID_CTL};
+static esp_gatt_srvc_id_t service_id;
+
+static void restart_timer_callback(void* arg) {
+    ESP_LOGI(TAG, "定时器触发，正在重启...");
+    esp_restart();
+}
+
+void handle_write_data(uint16_t handle, uint8_t *value, uint16_t len) {
+    if (handle == gl_profile_tab[PROFILE_APP_ID].char_handle_mac) {
+        if (len == sizeof(new_mac)) {
+            memcpy(new_mac, value, sizeof(new_mac));
+            new_mac_received = true;
+            ESP_LOGI(TAG, "收到新的MAC地址");
+        }
+    } else if (handle == gl_profile_tab[PROFILE_APP_ID].char_handle_adv) {
+        if (len <= sizeof(new_adv_data)) {
+            memcpy(new_adv_data, value, len);
+            new_adv_data_len = len;
+            new_adv_data_received = true;
+            ESP_LOGI(TAG, "收到新的广播数据");
+        }
+    } else if (handle == gl_profile_tab[PROFILE_APP_ID].char_handle_ctl) {
+        if (len == 1 && value[0] == 0x01) {
+            ESP_LOGI(TAG, "收到控制命令: 保存并重启");
+            write_config_to_nvs();
+            
+            const esp_timer_create_args_t restart_timer_args = {
+                .callback = &restart_timer_callback,
+                .name = "restart-timer"
+            };
+            esp_timer_handle_t restart_timer;
+            esp_timer_create(&restart_timer_args, &restart_timer);
+            esp_timer_start_once(restart_timer, 2000 * 1000); // 2 seconds
+        }
     }
 }
 
 
-// --- 主函数 app_main ---
-void app_main(void)
-{
-    esp_err_t ret;
-    ESP_LOGI(TAG, "程序启动...");
+static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
+    switch (event) {
+        case ESP_GATTS_REG_EVT: {
+            ESP_LOGI(TAG, "GATT应用注册成功, app_id %04x, gatts_if %d", param->reg.app_id, gatts_if);
+            gl_profile_tab[PROFILE_APP_ID].gatts_if = gatts_if;
+            service_id.is_primary = true;
+            service_id.id.inst_id = 0x00;
+            service_id.id.uuid.len = ESP_UUID_LEN_16;
+            service_id.id.uuid.uuid.uuid16 = GATTS_SERVICE_UUID;
+            esp_ble_gatts_create_service(gatts_if, &service_id, GATTS_NUM_HANDLE);
+            break;
+        }
+        case ESP_GATTS_CREATE_EVT: {
+            ESP_LOGI(TAG, "服务创建成功, service_handle %d", param->create.service_handle);
+            gl_profile_tab[PROFILE_APP_ID].service_handle = param->create.service_handle;
+            esp_ble_gatts_start_service(param->create.service_handle);
+            esp_ble_gatts_add_char(param->create.service_handle, &mac_char_uuid, ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
+            esp_ble_gatts_add_char(param->create.service_handle, &adv_char_uuid, ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_WRITE_NR, NULL, NULL);
+            esp_ble_gatts_add_char(param->create.service_handle, &ctl_char_uuid, ESP_GATT_PERM_WRITE, ESP_GATT_CHAR_PROP_BIT_WRITE, NULL, NULL);
+            break;
+        }
+        case ESP_GATTS_ADD_CHAR_EVT:
+            ESP_LOGI(TAG, "特征添加成功, attr_handle %d, uuid %04x", param->add_char.attr_handle, param->add_char.char_uuid.uuid.uuid16);
+            if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_MAC) { gl_profile_tab[PROFILE_APP_ID].char_handle_mac = param->add_char.attr_handle; } 
+            else if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_ADV) { gl_profile_tab[PROFILE_APP_ID].char_handle_adv = param->add_char.attr_handle; } 
+            else if (param->add_char.char_uuid.uuid.uuid16 == GATTS_CHAR_UUID_CTL) { gl_profile_tab[PROFILE_APP_ID].char_handle_ctl = param->add_char.attr_handle; }
+            break;
+        case ESP_GATTS_CONNECT_EVT:
+            ESP_LOGI(TAG, "设备连接: conn_id %d", param->connect.conn_id);
+            gl_profile_tab[PROFILE_APP_ID].conn_id = param->connect.conn_id;
+            esp_ble_gap_stop_advertising();
+            break;
+        case ESP_GATTS_DISCONNECT_EVT:
+            ESP_LOGI(TAG, "设备断开连接, reason 0x%x", param->disconnect.reason);
+            prepare_write_len = 0; // 清理长写入缓冲区
+            last_prepare_handle = 0;
+            esp_ble_gap_start_advertising(&adv_params);
+            break;
+        case ESP_GATTS_WRITE_EVT: {
+            if (param->write.is_prep) {
+                ESP_LOGI(TAG, "GATT PREPARE WRITE: handle %d, offset %d, len %d", param->write.handle, param->write.offset, param->write.len);
+                if (param->write.offset == 0) {
+                    last_prepare_handle = param->write.handle;
+                    prepare_write_len = 0;
+                }
+                if (param->write.offset + param->write.len <= sizeof(prepare_write_buf)) {
+                    memcpy(prepare_write_buf + param->write.offset, param->write.value, param->write.len);
+                    prepare_write_len = param->write.offset + param->write.len;
+                } else {
+                    ESP_LOGE(TAG, "Prepare write overflow");
+                }
+                if (param->write.need_rsp) {
+                    esp_gatt_rsp_t rsp;
+                    rsp.attr_value.handle = param->write.handle;
+                    rsp.attr_value.offset = param->write.offset;
+                    rsp.attr_value.len = param->write.len;
+                    rsp.attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
+                    memcpy(rsp.attr_value.value, param->write.value, param->write.len);
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, &rsp);
+                }
+            } else {
+                ESP_LOGI(TAG, "GATT NORMAL WRITE: handle %d, len %d", param->write.handle, param->write.len);
+                if (param->write.need_rsp){
+                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
+                }
+                handle_write_data(param->write.handle, param->write.value, param->write.len);
+            }
+            break;
+        }
+        case ESP_GATTS_EXEC_WRITE_EVT: {
+            ESP_LOGI(TAG, "GATT EXEC WRITE");
+            esp_ble_gatts_send_response(gatts_if, param->exec_write.conn_id, param->exec_write.trans_id, ESP_GATT_OK, NULL);
+            if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC) {
+                handle_write_data(last_prepare_handle, prepare_write_buf, prepare_write_len);
+            }
+            prepare_write_len = 0;
+            last_prepare_handle = 0;
+            break;
+        }
+        default: break;
+    }
+}
 
-    // 1. 初始化NVS
+void app_main(void) {
+    esp_err_t ret;
     ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -106,54 +330,35 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // 2. 设置自定义MAC地址 (应在蓝牙控制器初始化之前)
-    ESP_LOGI(TAG, "设置自定义基础MAC地址...");
-    // 注意: 蓝牙最终的地址会是 base_mac + 2 (for public) or + 1 (for random)
-    uint8_t new_mac[6] = {0x10, 0xBB, 0xF3, 0xCC, 0xF8, 0x9F};
-    ret = esp_base_mac_addr_set(new_mac);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "设置MAC地址失败: %s", esp_err_to_name(ret));
-    }
+    read_config_from_nvs();
+    
+    ESP_LOGI(TAG, "设置基础MAC地址: %02x:%02x:%02x:%02x:%02x:%02x",
+             current_mac[0], current_mac[1], current_mac[2], current_mac[3], current_mac[4], current_mac[5]);
+    ret = esp_base_mac_addr_set(current_mac);
+    if (ret != ESP_OK) { ESP_LOGE(TAG, "设置基础MAC地址失败: %s", esp_err_to_name(ret)); }
 
-    // 释放传统蓝牙内存，仅使用BLE
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
-
     esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
     ret = esp_bt_controller_init(&bt_cfg);
-    if (ret) {
-        ESP_LOGE(TAG, "初始化蓝牙控制器失败: %s", esp_err_to_name(ret));
-        return;
-    }
-
+    if (ret) { ESP_LOGE(TAG, "初始化蓝牙控制器失败: %s", esp_err_to_name(ret)); return; }
     ret = esp_bt_controller_enable(ESP_BT_MODE_BLE);
-    if (ret) {
-        ESP_LOGE(TAG, "使能蓝牙控制器失败: %s", esp_err_to_name(ret));
-        return;
-    }
+    if (ret) { ESP_LOGE(TAG, "使能蓝牙控制器失败: %s", esp_err_to_name(ret)); return; }
 
     ret = esp_bluedroid_init();
-    if (ret) {
-        ESP_LOGE(TAG, "初始化Bluedroid失败: %s", esp_err_to_name(ret));
-        return;
-    }
-
+    if (ret) { ESP_LOGE(TAG, "初始化Bluedroid失败: %s", esp_err_to_name(ret)); return; }
     ret = esp_bluedroid_enable();
+    if (ret) { ESP_LOGE(TAG, "使能Bluedroid失败: %s", esp_err_to_name(ret)); return; }
+
+    ret = esp_ble_gatts_register_callback(gatts_profile_event_handler);
+    if (ret) { ESP_LOGE(TAG, "注册GATT回调失败, 错误代码 = %x", ret); return; }
+    ret = esp_ble_gap_register_callback(gap_event_handler);
+    if (ret) { ESP_LOGE(TAG, "注册GAP回调失败, 错误代码 = %x", ret); return; }
+    ret = esp_ble_gatts_app_register(PROFILE_APP_ID);
+    if (ret) { ESP_LOGE(TAG, "注册GATT应用失败, 错误代码 = %x", ret); return; }
+
+    // **新增**: 增加错误检查
+    ret = esp_ble_gap_config_adv_data_raw(current_adv_data, current_adv_data_len);
     if (ret) {
-        ESP_LOGE(TAG, "使能Bluedroid失败: %s", esp_err_to_name(ret));
-        return;
+        ESP_LOGE(TAG, "配置广播数据失败, 错误代码 = %x", ret);
     }
-
-    ret = esp_ble_gap_register_callback(esp_gap_cb);
-    if (ret){
-        ESP_LOGE(TAG, "注册GAP回调失败, 错误代码: %d", ret);
-        return;
-    }
-
-    ESP_LOGI(TAG, "开始配置广播数据...");
-    ret = esp_ble_gap_config_adv_data_raw(adv_raw_data, sizeof(adv_raw_data));
-    if (ret) {
-        ESP_LOGE(TAG, "配置广播数据失败, 错误代码: %x", ret);
-    }
-
-    ESP_LOGI(TAG, "初始化完成，等待蓝牙事件链完成...");
 }
