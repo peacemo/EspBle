@@ -66,7 +66,6 @@ static bool new_mac_received = false;
 static bool new_adv_data_received = false;
 static uint16_t new_adv_data_len = 0;
 
-// **新增**: 用于处理长写入的缓冲区
 static uint8_t prepare_write_buf[256];
 static uint16_t prepare_write_len = 0;
 static uint16_t last_prepare_handle = 0;
@@ -136,18 +135,27 @@ esp_err_t write_config_to_nvs() {
     }
 
     if (new_adv_data_received) {
-        uint8_t adv_len = new_adv_data[0];
-        if (adv_len > 0 && new_adv_data_len > adv_len) {
-            err = nvs_set_blob(nvs_handle, NVS_KEY_ADV, &new_adv_data[1], adv_len);
-            if (err == ESP_OK) ESP_LOGI(TAG, "NVS: 新广播数据已写入");
-            uint8_t scan_len_index = 1 + adv_len;
-            if (new_adv_data_len > scan_len_index) {
-                uint8_t scan_len = new_adv_data[scan_len_index];
-                if (scan_len > 0 && new_adv_data_len >= scan_len_index + 1 + scan_len) {
-                     err = nvs_set_blob(nvs_handle, NVS_KEY_SCAN, &new_adv_data[scan_len_index + 1], scan_len);
-                     if (err == ESP_OK) ESP_LOGI(TAG, "NVS: 新扫描响应已写入");
-                } else { nvs_erase_key(nvs_handle, NVS_KEY_SCAN); }
-            } else { nvs_erase_key(nvs_handle, NVS_KEY_SCAN); }
+        // **修正**: 智能分割收到的原始数据流
+        uint8_t adv_len_to_write = (new_adv_data_len > 31) ? 31 : new_adv_data_len;
+        
+        err = nvs_set_blob(nvs_handle, NVS_KEY_ADV, new_adv_data, adv_len_to_write);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "NVS: 写入 %d 字节到广播数据", adv_len_to_write);
+        }
+
+        if (new_adv_data_len > 31) {
+            uint8_t scan_len_to_write = new_adv_data_len - 31;
+            if (scan_len_to_write > 31) {
+                scan_len_to_write = 31; // 最多31字节
+            }
+            err = nvs_set_blob(nvs_handle, NVS_KEY_SCAN, &new_adv_data[31], scan_len_to_write);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "NVS: 写入 %d 字节到扫描响应", scan_len_to_write);
+            }
+        } else {
+            // 如果总数据小于31字节，则没有扫描响应数据
+            nvs_erase_key(nvs_handle, NVS_KEY_SCAN);
+            ESP_LOGI(TAG, "NVS: 清除扫描响应数据");
         }
         new_adv_data_received = false;
     }
@@ -160,16 +168,29 @@ esp_err_t write_config_to_nvs() {
 
 /* ------------------- GAP 回调 ------------------- */
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
+    esp_err_t ret;
     switch (event) {
         case ESP_GAP_BLE_ADV_DATA_RAW_SET_COMPLETE_EVT:
-            esp_ble_gap_config_scan_rsp_data_raw(current_scan_rsp_data, current_scan_rsp_data_len);
+            ESP_LOGI(TAG, "广播数据设置完成，开始配置扫描响应...");
+            ret = esp_ble_gap_config_scan_rsp_data_raw(current_scan_rsp_data, current_scan_rsp_data_len);
+            if (ret){
+                ESP_LOGE(TAG, "配置扫描响应失败, 错误代码 = %x", ret);
+            }
             break;
         case ESP_GAP_BLE_SCAN_RSP_DATA_RAW_SET_COMPLETE_EVT:
-            esp_ble_gap_start_advertising(&adv_params);
+            ESP_LOGI(TAG, "扫描响应设置完成，开始广播...");
+            ret = esp_ble_gap_start_advertising(&adv_params);
+            if (ret) {
+                ESP_LOGE(TAG, "启动广播失败, 错误代码 = %x", ret);
+            }
             break;
         case ESP_GAP_BLE_ADV_START_COMPLETE_EVT:
-            if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) { ESP_LOGE(TAG, "广播启动失败"); } 
-            else { ESP_LOGI(TAG, "广播启动成功"); }
+            if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) { 
+                ESP_LOGE(TAG, "广播启动失败, 状态码 = %d", param->adv_start_cmpl.status);
+            } 
+            else { 
+                ESP_LOGI(TAG, "广播启动成功"); 
+            }
             break;
         default: break;
     }
@@ -186,7 +207,6 @@ static void restart_timer_callback(void* arg) {
     esp_restart();
 }
 
-// **新增**: 用于处理写入数据的独立函数
 void handle_write_data(uint16_t handle, uint8_t *value, uint16_t len) {
     if (handle == gl_profile_tab[PROFILE_APP_ID].char_handle_mac) {
         if (len == sizeof(new_mac)) {
@@ -252,14 +272,16 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             break;
         case ESP_GATTS_DISCONNECT_EVT:
             ESP_LOGI(TAG, "设备断开连接, reason 0x%x", param->disconnect.reason);
+            prepare_write_len = 0; // 清理长写入缓冲区
+            last_prepare_handle = 0;
             esp_ble_gap_start_advertising(&adv_params);
             break;
         case ESP_GATTS_WRITE_EVT: {
-            // **修正**: 正确处理长写入 (Prepare/Execute Write)
             if (param->write.is_prep) {
                 ESP_LOGI(TAG, "GATT PREPARE WRITE: handle %d, offset %d, len %d", param->write.handle, param->write.offset, param->write.len);
                 if (param->write.offset == 0) {
                     last_prepare_handle = param->write.handle;
+                    prepare_write_len = 0;
                 }
                 if (param->write.offset + param->write.len <= sizeof(prepare_write_buf)) {
                     memcpy(prepare_write_buf + param->write.offset, param->write.value, param->write.len);
@@ -267,7 +289,6 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
                 } else {
                     ESP_LOGE(TAG, "Prepare write overflow");
                 }
-                // Echo back the data for prepare write response
                 if (param->write.need_rsp) {
                     esp_gatt_rsp_t rsp;
                     rsp.attr_value.handle = param->write.handle;
@@ -277,7 +298,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
                     memcpy(rsp.attr_value.value, param->write.value, param->write.len);
                     esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, &rsp);
                 }
-            } else { // Normal write
+            } else {
                 ESP_LOGI(TAG, "GATT NORMAL WRITE: handle %d, len %d", param->write.handle, param->write.len);
                 if (param->write.need_rsp){
                     esp_ble_gatts_send_response(gatts_if, param->write.conn_id, param->write.trans_id, ESP_GATT_OK, NULL);
@@ -292,7 +313,6 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC) {
                 handle_write_data(last_prepare_handle, prepare_write_buf, prepare_write_len);
             }
-            // Reset buffer
             prepare_write_len = 0;
             last_prepare_handle = 0;
             break;
@@ -336,5 +356,9 @@ void app_main(void) {
     ret = esp_ble_gatts_app_register(PROFILE_APP_ID);
     if (ret) { ESP_LOGE(TAG, "注册GATT应用失败, 错误代码 = %x", ret); return; }
 
-    esp_ble_gap_config_adv_data_raw(current_adv_data, current_adv_data_len);
+    // **新增**: 增加错误检查
+    ret = esp_ble_gap_config_adv_data_raw(current_adv_data, current_adv_data_len);
+    if (ret) {
+        ESP_LOGE(TAG, "配置广播数据失败, 错误代码 = %x", ret);
+    }
 }
