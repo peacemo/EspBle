@@ -14,22 +14,21 @@
 // 日志打印时使用的标签
 static const char* TAG = "BLE_ADV_FIXED";
 
-// 目标模拟的完整 Raw Data (32字节)
-// 0201060BFFE00708F0B62F7FC70200030300AD0C094544494649455220424C45
-// 我们将其拆分为广播包 (adv_raw_data) 和扫描响应包 (scan_rsp_raw_data)
-
 // 广播包数据 (前19字节)
 static uint8_t adv_raw_data[] = {
-    0x02, 0x01, 0x06,                                                     // AD 1: Flags
-    0x0B, 0xFF, 0xE0, 0x07, 0x08, 0xF0, 0xB6, 0x2F, 0x7F, 0xC7, 0x02, 0x00, // AD 2: Manufacturer Specific Data
-    0x03, 0x03, 0x00, 0xAD                                                // AD 3: Incomplete List of 16-bit Service Class UUIDs
-    // 共 19 字节
+    // AD 1: Flags (3 bytes)
+    0x02, 0x01, 0x06,
+    // AD 2: Manufacturer Specific Data (24 bytes)
+    0x17, 0xFF, 0x00, 0x01, 0xB5, 0x00, 0x02, 0x08, 0x21, 0x26, 0x37, 0x00,
+    0x00, 0x04, 0x99, 0x31, 0x39, 0x59, 0x06, 0x01, 0x10, 0x00, 0x00, 0x00,
+    // AD 3: Complete List of 16-bit Service Class UUIDs (4 bytes)
+    0x03, 0x03, 0x3C, 0xFE
 };
 
-// 扫描响应包数据 (后13字节)
+// 新的扫描响应包数据 (后13字节)
 static uint8_t scan_rsp_raw_data[] = {
-    0x0C, 0x09, 0x45, 0x44, 0x49, 0x46, 0x49, 0x45, 0x52, 0x20, 0x42, 0x4C, 0x45 // AD 1: Complete Local Name "EDIFIER BLE"
-    // 共 13 字节
+    // AD 1: Complete Local Name "RTK_BT_4.1" (13 bytes)
+    0x0C, 0x09, 0x52, 0x54, 0x4B, 0x5F, 0x42, 0x54, 0x5F, 0x34, 0x2E, 0x31
 };
 
 // 广播参数配置
@@ -74,7 +73,7 @@ static void esp_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
             if (param->adv_start_cmpl.status != ESP_BT_STATUS_SUCCESS) {
                 ESP_LOGE(TAG, "广播启动失败, 错误代码: %d", param->adv_start_cmpl.status);
             } else {
-                ESP_LOGI(TAG, "广播启动成功! 设备现在应该可以被扫描到。");
+                ESP_LOGI(TAG, "广播启动成功! 设备现在可以被扫描到。");
             }
             break;
         
@@ -110,13 +109,12 @@ void app_main(void)
     // 2. 设置自定义MAC地址 (应在蓝牙控制器初始化之前)
     ESP_LOGI(TAG, "设置自定义基础MAC地址...");
     // 注意: 蓝牙最终的地址会是 base_mac + 2 (for public) or + 1 (for random)
-    uint8_t new_mac[6] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};
+    uint8_t new_mac[6] = {0x10, 0xBB, 0xF3, 0xCC, 0xF8, 0x9F};
     ret = esp_base_mac_addr_set(new_mac);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "设置MAC地址失败: %s", esp_err_to_name(ret));
     }
 
-    // 3. 初始化蓝牙控制器
     // 释放传统蓝牙内存，仅使用BLE
     ESP_ERROR_CHECK(esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT));
 
@@ -133,7 +131,6 @@ void app_main(void)
         return;
     }
 
-    // 4. 初始化Bluedroid协议栈
     ret = esp_bluedroid_init();
     if (ret) {
         ESP_LOGE(TAG, "初始化Bluedroid失败: %s", esp_err_to_name(ret));
@@ -146,16 +143,12 @@ void app_main(void)
         return;
     }
 
-    // 5. 注册GAP回调函数
     ret = esp_ble_gap_register_callback(esp_gap_cb);
     if (ret){
         ESP_LOGE(TAG, "注册GAP回调失败, 错误代码: %d", ret);
         return;
     }
 
-    // 6. 启动配置流程
-    // 我们只在这里调用第一个配置函数。
-    // 后续的步骤 (配置扫描响应、启动广播) 将由回调函数根据事件链式触发。
     ESP_LOGI(TAG, "开始配置广播数据...");
     ret = esp_ble_gap_config_adv_data_raw(adv_raw_data, sizeof(adv_raw_data));
     if (ret) {
