@@ -234,6 +234,21 @@ void handle_write_data(uint16_t handle, uint8_t *value, uint16_t len) {
             esp_timer_create(&restart_timer_args, &restart_timer);
             esp_timer_start_once(restart_timer, 2000 * 1000); // 2 seconds
         }
+        if (len == 1 && value[0] == 0x02) {
+            ESP_LOGI(TAG, "收到控制命令: 重置并重启");
+
+            esp_err_t err = nvs_flash_erase();
+            err = nvs_flash_init();
+            ESP_LOGE(TAG, "重置完成，正在重启...");
+            
+            const esp_timer_create_args_t restart_timer_args = {
+                .callback = &restart_timer_callback,
+                .name = "restart-timer"
+            };
+            esp_timer_handle_t restart_timer;
+            esp_timer_create(&restart_timer_args, &restart_timer);
+            esp_timer_start_once(restart_timer, 2000 * 1000); // 2 seconds
+        }
     }
 }
 
