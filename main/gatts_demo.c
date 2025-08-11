@@ -51,8 +51,13 @@ static struct gatts_profile_inst gl_profile_tab[PROFILE_NUM] = {
 
 /* ------------------- 全局变量 ------------------- */
 static uint8_t default_mac[6] = {0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F};
-static uint8_t default_adv_data[] = {0x02, 0x01, 0x06, 0x03, 0x03, 0xAA, 0xFE, 0x0C, 0x16, 0xAA, 0xFE, 0x00, 0x00, 0x45, 0x53, 0x50, 0x33, 0x32};
-static uint8_t default_scan_rsp_data[] = {0x0F, 0x09, 'E', 'S', 'P', '_', 'C', 'O', 'N', 'F', 'I', 'G', 'U', 'R', 'E'};
+static uint8_t default_adv_data[] = {
+    0x02, 0x01, 0x06,       // Flags: LE General Discoverable Mode
+    0x03, 0x03, 0xAA, 0xFE,  // 16-bit Service UUID: 0xFEA
+    0x06, 0x09, 'E', 'S', 'P', '3', '2',  // Complete Local Name: "ESP32"
+    0x0C, 0x16, 0xAA, 0xFE, 0x00, 0x00, 0x45, 0x53, 0x50, 0x33, 0x32  // Manufacturer Specific Data
+};
+static uint8_t default_scan_rsp_data[] = {0x00};
 
 static uint8_t current_mac[6];
 static uint8_t current_adv_data[31];
@@ -225,6 +230,21 @@ void handle_write_data(uint16_t handle, uint8_t *value, uint16_t len) {
         if (len == 1 && value[0] == 0x01) {
             ESP_LOGI(TAG, "收到控制命令: 保存并重启");
             write_config_to_nvs();
+            
+            const esp_timer_create_args_t restart_timer_args = {
+                .callback = &restart_timer_callback,
+                .name = "restart-timer"
+            };
+            esp_timer_handle_t restart_timer;
+            esp_timer_create(&restart_timer_args, &restart_timer);
+            esp_timer_start_once(restart_timer, 2000 * 1000); // 2 seconds
+        }
+        if (len == 1 && value[0] == 0x02) {
+            ESP_LOGI(TAG, "收到控制命令: 重置并重启");
+
+            esp_err_t err = nvs_flash_erase();
+            err = nvs_flash_init();
+            ESP_LOGE(TAG, "重置完成，正在重启...");
             
             const esp_timer_create_args_t restart_timer_args = {
                 .callback = &restart_timer_callback,
